@@ -19,6 +19,9 @@ test = [
     "pytest>=8.0",
     "pytest-cov>=5.0",
 ]
+observability = [
+    "langsmith>=0.1",
+]
 
 [build-system]
 requires = ["setuptools>=61"]

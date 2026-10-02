@@ -20,13 +20,16 @@ schema conformance, and fail-closed human handoff.
 
 LLM failure (missing key, timeout, model error, schema violation) → degraded fallback:
 no classification, every ticket routes to `escalate to human` at confidence 0.5
-(fail-closed, never auto-responds).
+(fail-closed, never auto-responds). The fallback fetches the customer profile only —
+no billing/status/KB lookups (they add no decision value when the outcome is fixed);
+the profile is quoted into reasoning for the human handoff.
 Tool misses (unknown customer/region, KB no-match) return model-readable strings, never
 raise exceptions, and are quoted in reasoning. Stale global status page → per-region
 check is authoritative (`asia: degraded`). Long-thread KB noise → `kb_refs` capped at
-top-2 exact hits. Thai input → English-only output rule ensures consistent downstream
-triage. False-positive reasoning keywords → negated phrasing checks in `decide` prevent
-mis-escalating benign inquiries.
+top-2 hits. Thai input → English-only output rule ensures consistent downstream
+triage; Thai keyword synonyms in KB entries + Thai deadline/dispute hints in `decide`
+cover spaceless Thai queries. False-positive escalation → word-boundary `500` matching
+and negated-phrasing checks (EN + TH) in `decide` prevent mis-escalating benign inquiries.
 
 ## 3. Evaluating in production
 

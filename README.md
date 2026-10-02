@@ -32,7 +32,7 @@ See `docs/writeup.md` for architecture decisions, failure modes, and production 
 - **Knowledge-base grounding** — keyword search over 6 FAQ entries, cited as `kb_refs[]` (capped at top-2).
 - **Deterministic safety policy** — OR escalation (dispute threat, unrefunded money + deadline, org/region outage) applied over LLM analysis + tool evidence.
 - **4 mock tools** — `get_customer_profile`, `search_knowledge_base`, `check_system_status`, `check_billing` (no network, no key needed).
-- **Fail-closed fallback** — no key or LLM error → every ticket `escalate to human` at confidence 0.5, never auto-responds.
+- **Fail-closed fallback** — no key or LLM error → every ticket `escalate to human` at confidence 0.5 (customer profile quoted in reasoning, no billing/status/KB lookups), never auto-responds.
 - **FastAPI service** — `POST /triage` (single) + `POST /triage/batch` (many), `GET /tickets/samples`, `GET /health`, and direct `GET /tools/*` mock-tool checks; interactive docs at `/docs`, Postman collection included.
 
 ## How it works
@@ -86,10 +86,15 @@ Edit dependencies in `pyproject.toml` only, then regenerate the lockfile:
 
 | Variable | Default | Description |
 |---|---|---|
-| `LLM_PROVIDER` | `openai` | `openai` or `gemini` |
+| `LLM_PROVIDER` | `openai` | `openai` or `gemini` (unknown values warn + fall back to `openai`) |
 | `OPENAI_API_KEY` / `OPENAI_MODEL` | `gpt-6-luna` | OpenAI path |
 | `GOOGLE_API_KEY` / `GEMINI_MODEL` | `gemini-3.1-flash-lite` | Gemini path |
-| `LANGSMITH_TRACING` / `LANGSMITH_API_KEY` | unset | Optional tracing |
+| `LANGSMITH_TRACING` / `LANGSMITH_API_KEY` | unset | Optional tracing (needs `pip install -e ".[observability]"` for `langsmith`) |
+| `BATCH_CONCURRENCY` | `4` | Max parallel graph runs per `/triage/batch` (clamped 1–8) |
+| `TRIAGE_TIMEOUT_S` | `120` | Per-ticket graph timeout (invalid → 120) |
+| `RATE_LIMIT_PER_MIN` | `120` | Per-IP limit on `POST /triage*` + `/v1/triage*` (`0` disables, bad value → 120, excess → `429`) |
+| `ALLOWED_ORIGINS` | `*` | Comma-separated CORS origins (dev open; set explicit origins in prod) |
+| `TRIAGE_API_KEY` / `API_KEY` | unset | Optional shared-secret auth (`x-api-key` header; unset = open) |
 
 > [!IMPORTANT]
 > Export the file before running — the code reads `os.getenv` directly:
@@ -143,14 +148,14 @@ Endpoints:
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/` | Service map (links to `/docs`, `/health`, endpoint list) |
-| `GET` | `/health` | Liveness + `llm_provider` / `llm_configured` status |
+| `GET` | `/health` (`/v1/health` alias) | Liveness + `llm_provider` / `llm_configured` status |
 | `GET` | `/tickets/samples` | The 3 sample tickets already shaped as `TriageRequest` (`{count, tickets[]}`) — copy-paste into `POST /triage` |
-| `POST` | `/triage` | Triage one ticket (`{id, customer_id, messages: [{timestamp, text}]}`) → `{ticket_id, llm_provider, llm_configured, result}` |
-| `POST` | `/triage/batch` | Triage many tickets (`{tickets: [...]}`) → `{count, results: [{ticket_id, result}]}` (sequential, fail-fast per ticket) |
+| `POST` | `/triage` (`/v1/triage` alias) | Triage one ticket (`{id, customer_id, messages: [{timestamp, text}]}`) → `{ticket_id, llm_provider, llm_configured, result}` (max 20k chars/ticket) |
+| `POST` | `/triage/batch` (`/v1/triage/batch` alias) | Triage many tickets (`{tickets: [...]}` max 20, max 60k chars/batch) → `{count, ok, errors, results: [{ticket_id, result} \| {ticket_id, error}]}` (parallel fan-out, order preserved, per-item errors never abort the batch) |
 | `GET` | `/tools/profile?customer_id=` | Direct mock-tool check (no key needed) |
 | `GET` | `/tools/billing?customer_id=` | Direct mock-tool check |
 | `GET` | `/tools/status?region=asia` | Direct mock-tool check |
-| `GET` | `/tools/kb?query=` | Direct mock-tool check |
+| `GET` | `/tools/kb?query=` | Direct mock-tool check (query max 2000 chars) |
 
 ### Quickstart
 
@@ -217,11 +222,12 @@ Errors to know:
 
 | Status | When | Example |
 |---|---|---|
-| `422` | Invalid payload schema / empty `messages` or `tickets` | `{"messages": []}` → `messages must not be empty` |
-| `502` | Triage logic crashed (LLM/tool crash) — not the normal fallback | `triage failed for <id>: ...` (the no-key fallback still returns `200` with `escalate to human`) |
+| `401` | `TRIAGE_API_KEY` set but `x-api-key` header missing/wrong | `{"detail":"invalid or missing api key"}` |
+| `422` | Invalid payload schema / empty or blank `messages`, blank `customer_id`, oversize single ticket (>20k chars), oversize batch (>20 tickets or >60k chars) or message (>4000 chars) | `{"messages": []}` → validation error |
+| `502` | Single-ticket triage crashed or timed out (`TRIAGE_TIMEOUT_S`) — not the normal fallback | `triage failed: ...` / `triage timed out` (the no-key fallback still returns `200` with `escalate to human`; batch per-item failures return `200` with `{ticket_id, error}` entries instead) |
 
 > [!NOTE]
-> `POST /triage*` runs as `asyncio.to_thread(run_ticket, …)` — the sync LangGraph run never blocks the event loop; batch processes tickets sequentially in order, not as a parallel fan-out.
+> `POST /triage*` runs the sync LangGraph in `asyncio.to_thread(run_ticket, …)` — the event loop never blocks; batch fans out in parallel (concurrency via `BATCH_CONCURRENCY`, default 4) with order preserved. Every response carries an `X-Request-ID` header and the server logs method/path/status/latency.
 
 ## Postman
 
@@ -269,7 +275,7 @@ Example output (truncated):
 .venv/bin/python -m pytest -q
 ```
 
-Covers graph compilation, fail-closed fallback (all tickets escalate at 0.5 with no key), ReAct routing (`tools` vs `decide`), all 4 mock tools, and CLI output for the 3 sample tickets. The FastAPI layer itself has no automated tests yet — verify manually via `/docs` try-it-out or the Postman collection (including the `422` empty-messages case and the no-key `escalate to human` fallback).
+Covers graph compilation, fail-closed fallback (all tickets escalate at 0.5 with no key), ReAct routing (`tools` vs `decide`), all 4 mock tools, CLI output for the 3 sample tickets, and the FastAPI layer (`/health`, `/tickets/samples`, `POST /triage` + `/triage/batch` incl. the `422` empty-payload cases and no-key `escalate to human` fallback, `GET /tools/*`). For manual exploration use `/docs` try-it-out or the Postman collection.
 
 ## Project structure
 
@@ -302,7 +308,8 @@ tests/
 |---|---|
 | All tickets `escalate to human`, confidence 0.5, fields `unknown` | Degraded fallback — no/invalid key. Check `LLM_PROVIDER` matches the key you set (`OPENAI_API_KEY` vs `GOOGLE_API_KEY`) and that `.env` is exported. Same over HTTP: `/health` shows `llm_configured: false`, `/triage` still returns `200` with fallback result. |
 | `POST /triage` → `422 messages must not be empty` | Empty `messages[]` (or empty `tickets[]` on batch). Send at least 1 message; see `GET /tickets/samples` for valid shape. |
-| `POST /triage` → `502 triage failed…` | Exception inside `run_ticket` (not the normal no-key fallback). Check server logs; retry — batch is fail-fast on the failing ticket. |
+| `POST /triage` → `502 triage failed…` | Exception inside `run_ticket` (not the normal no-key fallback). Check server logs; retry — batch captures per-ticket errors inline (`{ticket_id, error}`) without aborting. |
+| `POST /triage*` → `429 rate limit exceeded` | Too many triage calls from one IP. Wait a minute or raise `RATE_LIMIT_PER_MIN` (`0` disables). |
 | Port `8000` already in use / `docker compose up api` won't start | Another uvicorn running — stop it or remap (`.venv/bin/python app.py --port 8001`, update Postman `baseUrl`). |
 | `automatic function calling` warnings on stderr (Gemini) | Outdated workaround — `nodes.py:_with_structured_output_no_afc` should bind `AutomaticFunctionCallingConfig(disable=True)`. |
 | `Customer not found` / `Unknown region` / `No matching articles` in reasoning | Mock-data miss — tools return strings, never raise; `decide` fail-closes to `escalate to human`. Check `mock_data.py` ids/regions. |
