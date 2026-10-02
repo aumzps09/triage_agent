@@ -1,4 +1,4 @@
-# Write-up: Support Ticket Triage Agent (1 page)
+# Write-up: Support Ticket Triage Agent
 
 ## 1. Architecture decisions (and why)
 
@@ -36,3 +36,22 @@ Live: sample + human-label agreement rate, override rate per action, escalation 
 (% escalates human agents uphold), tool invocation accuracy (% unnecessary tool calls),
 latency/token cost per ticket, and weekly KB-hit coverage for newly seen intents before
 adding new tools.
+
+## 4. API exposure (FastAPI — added after the console agent)
+
+Thin stateless wrapper (`triage_agent/api.py`) over the same `run_ticket()` the console
+runner uses — no graph fork, so console and HTTP can never drift. Root `app.py` is the
+direct entrypoint: it re-exports `app` (so both `python app.py` and `uvicorn app:app`
+work), loads `.env` via `python-dotenv`, and adds `--host/--port/--reload` flags
+(defaulting from `HOST`/`PORT` env). `POST /triage` (one
+ticket) and `POST /triage/batch` (sequential, fail-fast per ticket) validate via Pydantic
+(`TriageRequest` / `BatchTriageRequest`), convert to the internal ticket dict, and run the
+sync LangGraph inside `asyncio.to_thread` to keep the event loop free. `GET /tickets/samples`
+returns the 3 golden threads in request shape for copy-paste testing; `GET /tools/*`
+exposes the 4 mock tools directly (no LLM key needed) for debugging grounding.
+Fail-closed maps cleanly onto HTTP: no key → still `200` with `escalate to human` at 0.5
+(same as console); bad payload → `422` (`messages`/`tickets` empty); unexpected crash →
+`502`, never a silent wrong action. Production adds API-level signals on top of §3:
+p95 latency per endpoint, `4xx`/`5xx` rate, batch size distribution, and per-ticket
+`llm_provider`/`llm_configured` echo from `/health` and triage responses to detect
+key-misconfig incidents.

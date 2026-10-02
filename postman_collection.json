@@ -1,0 +1,157 @@
+{
+	"info": {
+		"name": "Support Ticket Triage Agent",
+		"description": "Live-test collection for the FastAPI triage service (`uvicorn triage_agent.api:app --port 8000`).\n\nFlow: 1) Health → 2) Samples → 3) Triage ticket-1/2/3 → 4) Custom + batch → 5) direct mock-tool checks (no LLM key needed).\n\nWithout an LLM key every `/triage` call fail-closes to `escalate to human` (confidence 0.5). Set `LLM_PROVIDER` + provider key in `.env` for the real LLM path.",
+		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+	},
+	"variable": [
+		{
+			"key": "baseUrl",
+			"value": "http://localhost:8000",
+			"type": "string"
+		}
+	],
+	"item": [
+		{
+			"name": "1 - Meta",
+			"item": [
+				{
+					"name": "GET root",
+					"request": {
+						"method": "GET",
+						"url": "{{baseUrl}}/"
+					}
+				},
+				{
+					"name": "GET health",
+					"request": {
+						"method": "GET",
+						"url": "{{baseUrl}}/health"
+					}
+				},
+				{
+					"name": "GET sample tickets",
+					"request": {
+						"method": "GET",
+						"url": "{{baseUrl}}/tickets/samples"
+					}
+				}
+			]
+		},
+		{
+			"name": "2 - Triage samples",
+			"item": [
+				{
+					"name": "POST triage ticket-1 billing",
+					"request": {
+						"method": "POST",
+						"header": [{ "key": "Content-Type", "value": "application/json" }],
+						"url": "{{baseUrl}}/triage",
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"id\": \"ticket-1-billing\",\n  \"customer_id\": \"cust_free_001\",\n  \"messages\": [\n    {\"timestamp\": \"3h ago\", \"text\": \"My payment failed when I tried to upgrade to Pro. Can you check what's wrong?\"},\n    {\"timestamp\": \"2h ago\", \"text\": \"I tried again with a different card. Now I see TWO pending charges but my account still shows Free plan??\"},\n    {\"timestamp\": \"1h ago\", \"text\": \"Just checked my bank app - I have THREE charges of $29.99 now. None of them refunded. And I STILL don't have Pro access.\"},\n    {\"timestamp\": \"just now\", \"text\": \"I have a presentation in 2 hours and I need the Pro export features. If these charges aren't reversed by end of day I'm disputing all of them with my bank.\"}\n  ]\n}"
+						}
+					}
+				},
+				{
+					"name": "POST triage ticket-2 outage (TH)",
+					"request": {
+						"method": "POST",
+						"header": [{ "key": "Content-Type", "value": "application/json" }],
+						"url": "{{baseUrl}}/triage",
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"id\": \"ticket-2-outage\",\n  \"customer_id\": \"cust_ent_th_045\",\n  \"messages\": [\n    {\"timestamp\": \"2h ago\", \"text\": \"ระบบเข้าไม่ได้ครับ ขึ้น error 500 (Can't access the system, showing error 500)\"},\n    {\"timestamp\": \"1.5h ago\", \"text\": \"ลองหลายเครื่องแล้ว ทั้ง Chrome, Safari, Firefox ผลเหมือนกันหมด เพื่อนร่วมงานก็เข้าไม่ได้เหมือนกัน\"},\n    {\"timestamp\": \"45m ago\", \"text\": \"ตอนนี้ลูกค้าโวยเข้ามาเยอะมาก เรามี demo กับลูกค้ารายใหญ่บ่ายนี้ ถ้าระบบไม่กลับมา deal นี้อาจจะหลุด\"},\n    {\"timestamp\": \"just now\", \"text\": \"เช็ค status.company.com แล้ว บอกว่า all systems operational แต่เราใช้งานไม่ได้จริงๆ ช่วยเช็คให้หน่อยได้ไหมครับ region Asia มีปัญหาหรือเปล่า?\"}\n  ]\n}"
+						}
+					}
+				},
+				{
+					"name": "POST triage ticket-3 darkmode",
+					"request": {
+						"method": "POST",
+						"header": [{ "key": "Content-Type", "value": "application/json" }],
+						"url": "{{baseUrl}}/triage",
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"id\": \"ticket-3-darkmode\",\n  \"customer_id\": \"cust_pro_123\",\n  \"messages\": [\n    {\"timestamp\": \"2d ago\", \"text\": \"Hey, just wondering if you support dark mode? No rush\"},\n    {\"timestamp\": \"1d ago\", \"text\": \"Thanks! It's in Settings > Appearance. Found it! But I'm on Pro and I only see 'Light' and 'System Default'. No dark mode toggle?\"},\n    {\"timestamp\": \"1d ago +3h\", \"text\": \"Switched to 'System Default' and my Mac is set to dark mode, but your app still shows light theme. Bug or am I missing something?\"},\n    {\"timestamp\": \"today\", \"text\": \"Also - is there a way to schedule dark mode? Like auto-switch at 6pm? Would be cool if you guys added it\"}\n  ]\n}"
+						}
+					}
+				}
+			]
+		},
+		{
+			"name": "3 - Custom + batch",
+			"item": [
+				{
+					"name": "POST triage custom darkmode",
+					"request": {
+						"method": "POST",
+						"header": [{ "key": "Content-Type", "value": "application/json" }],
+						"url": "{{baseUrl}}/triage",
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"id\": \"ticket-custom-darkmode-1\",\n  \"customer_id\": \"cust_pro_123\",\n  \"messages\": [\n    {\"timestamp\": \"1h ago\", \"text\": \"Hi, how do I turn on dark mode in your app?\"}\n  ]\n}"
+						}
+					}
+				},
+				{
+					"name": "POST triage batch (all 3)",
+					"request": {
+						"method": "POST",
+						"header": [{ "key": "Content-Type", "value": "application/json" }],
+						"url": "{{baseUrl}}/triage/batch",
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"tickets\": [\n    {\n      \"id\": \"ticket-1-billing\",\n      \"customer_id\": \"cust_free_001\",\n      \"messages\": [\n        {\"timestamp\": \"1h ago\", \"text\": \"I have THREE charges of $29.99, none refunded, still no Pro access.\"},\n        {\"timestamp\": \"just now\", \"text\": \"I have a presentation in 2 hours. If these charges aren't reversed by end of day I'm disputing them.\"}\n      ]\n    },\n    {\n      \"id\": \"ticket-2-outage\",\n      \"customer_id\": \"cust_ent_th_045\",\n      \"messages\": [\n        {\"timestamp\": \"2h ago\", \"text\": \"ระบบเข้าไม่ได้ครับ ขึ้น error 500\"},\n        {\"timestamp\": \"just now\", \"text\": \"status page says operational but Asia region seems down, demo this afternoon (บ่ายนี้)\"}\n      ]\n    },\n    {\n      \"id\": \"ticket-3-darkmode\",\n      \"customer_id\": \"cust_pro_123\",\n      \"messages\": [\n        {\"timestamp\": \"today\", \"text\": \"Dark mode on macOS stays light on System Default - bug? Also can I schedule auto-switch at 6pm?\"}\n      ]\n    }\n  ]\n}"
+						}
+					}
+				},
+				{
+					"name": "POST triage invalid (empty messages)",
+					"request": {
+						"method": "POST",
+						"header": [{ "key": "Content-Type", "value": "application/json" }],
+						"url": "{{baseUrl}}/triage",
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"id\": \"ticket-bad\",\n  \"customer_id\": \"cust_free_001\",\n  \"messages\": []\n}"
+						}
+					}
+				}
+			]
+		},
+		{
+			"name": "4 - Mock tools (no key needed)",
+			"item": [
+				{
+					"name": "GET tool profile",
+					"request": {
+						"method": "GET",
+						"url": "{{baseUrl}}/tools/profile?customer_id=cust_free_001"
+					}
+				},
+				{
+					"name": "GET tool billing",
+					"request": {
+						"method": "GET",
+						"url": "{{baseUrl}}/tools/billing?customer_id=cust_free_001"
+					}
+				},
+				{
+					"name": "GET tool status asia",
+					"request": {
+						"method": "GET",
+						"url": "{{baseUrl}}/tools/status?region=asia"
+					}
+				},
+				{
+					"name": "GET tool kb",
+					"request": {
+						"method": "GET",
+						"url": "{{baseUrl}}/tools/kb?query=duplicate%20charge%20refund"
+					}
+				}
+			]
+		}
+	]
+}

@@ -7,3 +7,13 @@ services:
         required: false
     # No ports/DB — console app only. No key → degraded fallback (escalate all);
     # set a provider key in .env (see .env.example) to enable the LLM path.
+
+  api:
+    build: .
+    image: triage-agent
+    command: ["uvicorn", "triage_agent.api:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "8000:8000"
+    env_file:
+      - path: .env
+        required: false

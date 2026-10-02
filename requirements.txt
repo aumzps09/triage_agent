@@ -1,0 +1,14 @@
+# Locked production install — generated from pyproject.toml (source of truth).
+
+# Install:
+#   pip install -r requirements.txt        # production / Docker (pinned)
+#   pip install -e ".[test]"               # local dev (+ pytest)
+
+langchain-core==1.6.6
+langgraph==1.2.12
+langchain-openai==1.6.7
+langchain-google-genai==4.4.0
+pydantic==2.13.5
+python-dotenv==1.2.4
+fastapi==0.142.2
+uvicorn==0.54.0
