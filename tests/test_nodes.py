@@ -3,11 +3,9 @@
 from __future__ import annotations
 
 from triage_agent.utils.nodes import (
-    _extract_region,
-    _mentions,
     decide,
+    decide_node,
     ingest,
-    retrieve,
 )
 
 
@@ -24,29 +22,36 @@ def test_ingest_formats_messages() -> None:
     assert "[just now] Second message" in text
 
 
-def test_mentions_finds_hint() -> None:
-    assert _mentions("payment failed on charge", ("charge", "billing"))
-    assert not _mentions("hello world", ("charge", "billing"))
+def test_decide_node_fallback_profile_only() -> None:
+    """Fallback fetches the customer profile only — no billing/status/KB calls."""
+    state = {
+        "fallback": True,
+        "ticket": {"customer_id": "cust_pro_123", "messages": [("now", "test")]},
+        "ticket_text": "[now] just a friendly hello",
+        "messages": [],
+    }
+    out = decide_node(state)
+    tools_out = out["tool_outputs"]
+    assert tools_out["kb_ids"] == []
+    assert "profile only" in tools_out["billing"]
+    assert "profile only" in tools_out["status"]
+    assert out["result"].next_action == "escalate to human"
+    assert out["result"].confidence == 0.5
+    # Profile is quoted into reasoning for the human handoff.
+    assert "plan=Pro" in out["result"].reasoning
 
 
-def test_extract_region_from_profile() -> None:
-    region = _extract_region("some text", "cust_ent_th_045")
-    assert region == "asia"
-
-
-def test_extract_region_from_text() -> None:
-    region = _extract_region("issue in europe datacenter", "cust_free_001")
-    assert region == "eu"
-
-
-def test_retrieve_invokes_relevant_tools() -> None:
-    ticket_text = "[just now] Payment charge failed, getting 500 error"
-    out = retrieve(ticket_text, "cust_free_001")
-    assert "plan=Free" in out["profile"]
-    assert "KB matches:" in out["kb"]
-    assert "3 charge(s)" in out["billing"]
-    assert "Region us: operational" in out["status"]
-    assert len(out["kb_ids"]) <= 2
+def test_decide_node_fallback_unknown_customer() -> None:
+    """Fallback with an unknown id still escalates with a readable profile note."""
+    state = {
+        "fallback": True,
+        "ticket": {"customer_id": "ghost", "messages": [("now", "test")]},
+        "ticket_text": "[now] test",
+        "messages": [],
+    }
+    out = decide_node(state)
+    assert out["result"].next_action == "escalate to human"
+    assert "Customer not found" in out["result"].reasoning
 
 
 def test_decide_degraded_fallback() -> None:
@@ -58,7 +63,8 @@ def test_decide_degraded_fallback() -> None:
     assert result.kb_refs == ["kb-1"]
 
 
-def test_decide_escalates_on_outage() -> None:
+def test_decide_trusts_llm_on_outage_signals() -> None:
+    """LLM decides: tool outage signals alone no longer force escalation."""
     analysis = {
         "urgency": "critical",
         "issue_types": ["outage"],
@@ -71,11 +77,11 @@ def test_decide_escalates_on_outage() -> None:
         "billing": "skipped",
     }
     result = decide(analysis, tool_outputs, ticket_text="error 500 everywhere")
-    assert result.next_action == "escalate to human"
-    assert result.confidence == 0.95
+    assert result.next_action == "route to specialist"
 
 
-def test_decide_escalates_on_billing_deadline() -> None:
+def test_decide_trusts_llm_on_billing_deadline() -> None:
+    """LLM decides: billing+deadline hints alone no longer force escalation."""
     analysis = {
         "urgency": "critical",
         "issue_types": ["billing"],
@@ -89,11 +95,11 @@ def test_decide_escalates_on_billing_deadline() -> None:
     }
     ticket_text = "I have a presentation in 2 hours and 3 charges pending"
     result = decide(analysis, tool_outputs, ticket_text=ticket_text)
-    assert result.next_action == "escalate to human"
-    assert result.confidence == 0.95
+    assert result.next_action == "route to specialist"
 
 
-def test_decide_escalates_on_dispute_threat() -> None:
+def test_decide_trusts_llm_on_dispute_threat() -> None:
+    """LLM decides: dispute wording alone no longer forces escalation."""
     analysis = {
         "urgency": "high",
         "issue_types": ["billing"],
@@ -103,8 +109,7 @@ def test_decide_escalates_on_dispute_threat() -> None:
     tool_outputs = {"kb_ids": [], "status": "skipped", "billing": "skipped"}
     ticket_text = "If not refunded, I am disputing all charges with my bank."
     result = decide(analysis, tool_outputs, ticket_text=ticket_text)
-    assert result.next_action == "escalate to human"
-    assert result.confidence == 0.95
+    assert result.next_action == "route to specialist"
 
 
 def test_decide_ignores_negated_dispute_reasoning() -> None:
@@ -160,8 +165,9 @@ def test_sentiment_normalization() -> None:
     assert TriageResult(urgency="low", sentiment="negative").sentiment == "negative"
     assert TriageResult(urgency="low", sentiment="neu").sentiment == "neutral"
     assert TriageResult(urgency="low", sentiment="nue").sentiment == "neutral"
+    # Clearly valenced adjectives map; ambiguous ones stay neutral.
     assert TriageResult(urgency="low", sentiment="furious").sentiment == "negative"
-    assert TriageResult(urgency="low", sentiment="friendly").sentiment == "positive"
+    assert TriageResult(urgency="low", sentiment="friendly").sentiment == "neutral"
 
 
 def test_decide_node_fallback() -> None:

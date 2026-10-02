@@ -32,6 +32,21 @@ def test_search_knowledge_base_no_matches() -> None:
     assert "No matching articles" in result
 
 
+def test_search_knowledge_base_thai_outage() -> None:
+    result = tools.search_knowledge_base.invoke({"query": "เซิร์ฟเวอร์ล่มเข้าไม่ได้เลย"})
+    assert "kb-outage-500" in result
+
+
+def test_search_knowledge_base_thai_billing() -> None:
+    result = tools.search_knowledge_base.invoke({"query": "ถูกตัดเงินซ้ำขอคืนเงิน"})
+    assert "kb-billing-duplicate" in result
+
+
+def test_search_knowledge_base_thai_darkmode() -> None:
+    result = tools.search_knowledge_base.invoke({"query": "โหมดมืดไม่ทำงาน"})
+    assert "kb-dark-mode" in result
+
+
 def test_check_system_status_known_region() -> None:
     result = tools.check_system_status.invoke({"region": "asia"})
     assert "Region asia: degraded" in result

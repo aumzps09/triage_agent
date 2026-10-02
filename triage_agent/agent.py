@@ -36,8 +36,8 @@ def build_graph():  # type: ignore[no-untyped-def]
 app = build_graph()
 
 
-def run_ticket(ticket: dict) -> TriageResult:
-    """End-to-end via the compiled graph: ingest -> analyze -> retrieve -> decide."""
-    final = app.invoke({"ticket": ticket})
+def run_ticket(ticket: dict, recursion_limit: int = 15) -> TriageResult:
+    """End-to-end via the compiled graph: ingest -> agent <-> tools -> decide."""
+    final = app.invoke({"ticket": ticket}, config={"recursion_limit": recursion_limit})
     result = final["result"]
     return result if isinstance(result, TriageResult) else TriageResult(**dict(result))

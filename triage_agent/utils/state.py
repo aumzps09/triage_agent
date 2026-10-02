@@ -18,11 +18,50 @@ class TriageResult(BaseModel):
     kb_refs: list[str] = Field(default_factory=list)
     next_action: NextAction = "route to specialist"
     reasoning: str = ""
-    confidence: float = 0.0
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+
+    @field_validator("product", mode="before")
+    @classmethod
+    def normalize_product(cls, v: object) -> str:
+        return str(v or "").strip().lower() or "general"
+
+    @field_validator("issue_types", mode="before")
+    @classmethod
+    def normalize_issue_types(cls, v: object) -> list[str]:
+        if not isinstance(v, list):
+            return []
+        return [str(t).strip().lower() for t in v if str(t).strip()]
+
+    @field_validator("kb_refs", mode="before")
+    @classmethod
+    def normalize_kb_refs(cls, v: object) -> list[str]:
+        if not isinstance(v, list):
+            return []
+        seen: list[str] = []
+        for r in v:
+            s = str(r).strip()
+            if s and s not in seen:
+                seen.append(s)
+        return seen[:2]
+
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def clamp_confidence(cls, v: object) -> float:
+        try:
+            f = float(v)  # type: ignore[arg-type]
+        except Exception:
+            return 0.0
+        # Accept 0-100 percent style from drifting LLMs, then clamp.
+        if f > 1.0 and f <= 100.0:
+            f = f / 100.0
+        return max(0.0, min(1.0, f))
 
     @field_validator("sentiment", mode="before")
     @classmethod
     def normalize_sentiment(cls, v: str) -> str:
+        # Only exact labels + common abbreviations plus clearly valenced
+        # adjectives. Anything unrecognized falls back to neutral instead
+        # of guessing, so LLM schema drift stays visible.
         s = str(v).lower().strip()
         if s in ("pos", "positive"):
             return "positive"
@@ -32,10 +71,9 @@ class TriageResult(BaseModel):
             return "neutral"
         if s in ("unknown", ""):
             return "unknown"
-        # If open-ended adjective received, map to 3-class fallback
-        if any(w in s for w in ("furious", "angry", "frustrated", "bad", "terrible", "urgent")):
+        if s in ("furious", "angry", "irate", "upset", "frustrated", "unhappy", "disappointed"):
             return "negative"
-        if any(w in s for w in ("friendly", "good", "happy", "great", "positive")):
+        if s in ("happy", "pleased", "satisfied", "delighted"):
             return "positive"
         return "neutral"
 

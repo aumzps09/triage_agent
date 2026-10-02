@@ -1,7 +1,7 @@
 """Mock tool contracts for the triage agent.
 
-Design (per topology ticket): the LangGraph `retrieve` node calls these tools —
-no ToolNode loop, no network, no API key. Each tool is defined with
+Design: the LangGraph `agent` node binds these tools via a `ToolNode` loop —
+no network, no API key. Each tool is defined with
 `langchain_core.tools.tool` at the definition site so the same object works
 both as a plain callable (via `.invoke`) and when bound to an LLM.
 
@@ -11,6 +11,8 @@ Failure policy: never raise on bad input; return a model-readable string so the
 
 from __future__ import annotations
 
+import re
+
 from langchain_core.tools import tool
 
 from .mock_data import BILLING_CHARGES, CUSTOMERS, KB_ENTRIES, SYSTEM_STATUS
@@ -19,10 +21,11 @@ from .mock_data import BILLING_CHARGES, CUSTOMERS, KB_ENTRIES, SYSTEM_STATUS
 @tool
 def get_customer_profile(customer_id: str) -> str:
     """Look up plan, tenure, seats, and ticket history. Mock returns static string."""
-    customer = CUSTOMERS.get(customer_id.strip())
+    cid = str(customer_id or "").strip()
+    customer = CUSTOMERS.get(cid)
     if customer is None:
         known = ", ".join(sorted(CUSTOMERS))
-        return f"Customer not found: {customer_id!r}. Known ids: {known}."
+        return f"Customer not found: {cid!r}. Known ids: {known}."
     parts = [f"{k}={v}" for k, v in customer.items()]
     return "Customer profile: " + "; ".join(parts) + "."
 
@@ -30,26 +33,42 @@ def get_customer_profile(customer_id: str) -> str:
 @tool
 def search_knowledge_base(query: str) -> str:
     """Search FAQ/docs. Mock keyword-matches static entries, returns ids + titles."""
-    tokens = [t.lower() for t in query.split() if len(t) > 2]
+    low_query = str(query or "").lower()[:2000]
+    tokens = [t for t in low_query.split() if len(t) > 2]
     if not tokens:
         return "No matching articles. Hint: query with keywords like 'charge', '500', 'dark mode'."
     scored = []
     for entry in KB_ENTRIES:
         hay = " ".join([entry["title"], entry["text"], " ".join(entry["keywords"])]).lower()
-        score = sum(1 for t in tokens if t in hay)
+        score = 0
+        for t in tokens:
+            if re.fullmatch(r"[a-z0-9]+", t):
+                if re.search(rf"\b{re.escape(t)}\b", hay):
+                    score += 1
+            elif t in hay:
+                score += 1
+        for kw in entry["keywords"]:
+            kl = kw.lower()
+            if re.fullmatch(r"[a-z0-9][a-z0-9 \-]*", kl):
+                if re.search(rf"\b{re.escape(kl)}\b", low_query):
+                    score += 2
+            elif kl in low_query:
+                score += 2
         if score:
             scored.append((score, entry))
     if not scored:
         return "No matching articles. Hint: query with keywords like 'charge', '500', 'dark mode'."
     scored.sort(key=lambda s: -s[0])
-    lines = [f"{e['id']}: {e['title']}" for _, e in scored[:3]]
+    # Top-2 matches the kb_refs cap enforced in decide_node.
+    lines = [f"{e['id']}: {e['title']}" for _, e in scored[:2]]
     return "KB matches: " + " | ".join(lines) + "."
 
 
 @tool
 def check_system_status(region: str) -> str:
     """Check per-region status. Global status page can be stale; region is authoritative."""
-    key = region.strip().lower()
+    raw = str(region or "")
+    key = raw.strip().lower()
     regions = SYSTEM_STATUS["regions"]
     if key not in regions:
         return (
@@ -66,12 +85,13 @@ def check_system_status(region: str) -> str:
 @tool
 def check_billing(customer_id: str) -> str:
     """List charges for a customer: amounts, pending vs refunded."""
-    charges = BILLING_CHARGES.get(customer_id.strip())
+    cid = str(customer_id or "").strip()
+    charges = BILLING_CHARGES.get(cid)
     if not charges:
-        return f"No charges on file for {customer_id!r}."
+        return f"No charges on file for {cid!r}."
     pending = sum(c["amount"] for c in charges if not c["refunded"])
     return (
-        f"Billing for {customer_id!r}: {len(charges)} charge(s), "
+        f"Billing for {cid!r}: {len(charges)} charge(s), "
         f"${pending:.2f} pending/unrefunded. "
         "Account still shows Free plan until settlement."
     )

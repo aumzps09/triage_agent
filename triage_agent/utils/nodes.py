@@ -1,7 +1,7 @@
-"""Node functions for the triage graph: ingest -> analyze -> retrieve -> decide.
+"""Node functions for the triage graph: ingest -> agent <-> tools -> decide.
 
-`analyze` tries the LangChain structured-output path first
-(`triage_prompt | llm.with_structured_output`); if the LLM is unavailable the
+`decide_node` synthesizes the ReAct message history via structured output
+(`finalize_prompt | llm.with_structured_output`); if the LLM is unavailable the
 degraded fallback marks the analysis as such and `decide` escalates every
 ticket to a human (no pretend classification).
 """
@@ -9,69 +9,99 @@ ticket to a human (no pretend classification).
 from __future__ import annotations
 
 import os
-import re
 from typing import Literal
 
 from langchain_core.messages import (
     AIMessage,
-    BaseMessage,
     HumanMessage,
     SystemMessage,
     ToolMessage,
 )
 
-from ..prompts import REACT_AGENT_SYSTEM_PROMPT, finalize_prompt, triage_prompt
+from ..prompts import REACT_AGENT_SYSTEM_PROMPT, finalize_prompt
 from . import tools
-from .mock_data import CUSTOMERS, SYSTEM_STATUS
 from .state import TicketState, TriageResult
 
-_BILLING_HINTS = ("charge", "billing", "refund", "dispute", "pending", "$", "upgrade")
-_OUTAGE_HINTS = ("500", "outage", "error", "region", "status", "demo", "เข้าไม่ได้", "โวย")
 
-
-def _mentions(low: str, hints: tuple[str, ...]) -> bool:
-    """Keyword check for tool routing in `retrieve`."""
-    return any(h in low for h in hints)
 
 
 def ingest(ticket: dict) -> str:
-    """Join the whole thread (timestamps kept) into one text for analysis."""
-    return "\n".join(f"[{t}] {m}" for t, m in ticket["messages"])
+    """Join the whole thread (timestamps kept) into one text for analysis.
+
+    Accepts both internal tuple pairs ``(timestamp, text)`` and API-style
+    dicts ``{"timestamp": ..., "text": ...}`` so direct ``run_ticket`` calls
+    can't crash on shape mismatch.
+    """
+    lines = []
+    for m in ticket.get("messages", []):
+        if isinstance(m, dict):
+            t, text = m.get("timestamp", "just now"), m.get("text", "")
+        else:
+            try:
+                t, text = m
+            except Exception:
+                continue
+        lines.append(f"[{t}] {text}")
+    return "\n".join(lines)
 
 
-def get_llm():  # type: ignore[no-untyped-def]
-    """Return the configured ChatModel instance, or None if keys are absent."""
-    provider = os.getenv("LLM_PROVIDER", "openai").strip().lower()
+def _build_llm(provider: str, model: str, api_key: str):  # type: ignore[no-untyped-def]
+    """Construct a fresh ChatModel per call (no global cache).
+
+    Previously cached with lru_cache keyed on the raw api_key — that pinned
+    secrets in memory and shared one client across asyncio.to_thread workers.
+    Construction is cheap (no network); invoke() does the I/O, so building
+    per node call is safer and barely slower.
+    """
+    if not api_key:
+        return None
     try:
         if provider == "gemini":
-            if not os.getenv("GOOGLE_API_KEY"):
-                return None
             from langchain_google_genai import ChatGoogleGenerativeAI
 
             return ChatGoogleGenerativeAI(
-                model=os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite"), temperature=0
+                model=model,
+                temperature=0,
+                timeout=60,
+                max_retries=2,
+                google_api_key=api_key,
             )
         else:
-            if not os.getenv("OPENAI_API_KEY"):
-                return None
             from langchain_openai import ChatOpenAI
 
-            return ChatOpenAI(model=os.getenv("OPENAI_MODEL", "gpt-6-luna"))
+            return ChatOpenAI(
+                model=model,
+                temperature=0,
+                timeout=60,
+                max_retries=2,
+                openai_api_key=api_key,
+            )
     except Exception:
         return None
 
 
-def _llm_analyze(ticket_text: str) -> TriageResult | None:
-    """Try the LangChain structured-output path; return None on any failure."""
-    llm = get_llm()
-    if llm is None:
-        return None
-    try:
-        chain = triage_prompt | _with_structured_output_no_afc(llm)
-        out = chain.invoke({"ticket_text": ticket_text})
-        return out if isinstance(out, TriageResult) else TriageResult(**dict(out))
-    except Exception:
-        return None
+def get_llm():  # type: ignore[no-untyped-def]
+    """Return a ChatModel instance, or None if keys are absent.
+
+    Unknown LLM_PROVIDER values fall back to openai with a warning (typos
+    previously failed silently to openai with no signal).
+    """
+    import logging
+
+    raw = os.getenv("LLM_PROVIDER", "openai").strip().lower()
+    if raw == "gemini":
+        provider = "gemini"
+        model = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
+        api_key = os.getenv("GOOGLE_API_KEY", "")
+    else:
+        if raw not in ("", "openai"):
+            logging.getLogger("triage_agent.nodes").warning(
+                "unknown LLM_PROVIDER=%r, falling back to openai", raw
+            )
+        provider = "openai"
+        model = os.getenv("OPENAI_MODEL", "gpt-6-luna")
+        api_key = os.getenv("OPENAI_API_KEY", "")
+    return _build_llm(provider, model, api_key)
 
 
 def _with_structured_output_no_afc(llm):  # type: ignore[no-untyped-def]
@@ -103,53 +133,26 @@ def _degraded_analyze() -> dict:
     }
 
 
-def analyze(ticket_text: str) -> dict:
-    """Classify + extract via LLM; degraded escalate-all if the LLM is unavailable."""
-    llm_result = _llm_analyze(ticket_text)
-    if llm_result is not None:
-        return llm_result.to_dict()
-    return _degraded_analyze()
 
 
-def _extract_region(ticket_text: str, customer_id: str) -> str:
-    """Prefer the customer profile region; fall back to thread keywords."""
-    profile = CUSTOMERS.get(customer_id.strip(), {})
-    region_field = str(profile.get("region", "")).lower()
-    for known in sorted(SYSTEM_STATUS["regions"]):
-        if known and known in region_field:
-            return known
-    if "thailand" in region_field or "thai" in ticket_text.lower():
-        return "asia"
-    low = ticket_text.lower()
-    for known in sorted(SYSTEM_STATUS["regions"]):
-        if known in low:
-            return known
-    return "asia"
 
-
-def retrieve(ticket_text: str, customer_id: str) -> dict:
-    """Call tools directly: profile+KB always, others by keyword."""
-    low = ticket_text.lower()
-    out = {
-        "profile": tools.get_customer_profile.invoke({"customer_id": customer_id}),
-        "kb": tools.search_knowledge_base.invoke({"query": ticket_text}),
-    }
-    out["billing"] = (
-        tools.check_billing.invoke({"customer_id": customer_id})
-        if _mentions(low, _BILLING_HINTS)
-        else "skipped (no billing signals)."
-    )
-    if _mentions(low, _OUTAGE_HINTS):
-        out["status"] = tools.check_system_status.invoke({"region": _extract_region(ticket_text, customer_id)})
-    else:
-        out["status"] = "skipped (no outage signals)."
-    out["kb_ids"] = re.findall(r"kb-[\w-]+", out["kb"])[:2]
-    return out
+def _extract_kb_ids(text: str) -> list[str]:
+    """Extract kb-* IDs from tool output without regex."""
+    ids: list[str] = []
+    for token in str(text).replace("|", " ").replace(":", " ").split():
+        cand = token.strip().strip(".,;()[]\"'")
+        cand = "".join(ch for ch in cand if ch.isalnum() or ch in ("-", "_"))
+        if cand.startswith("kb-") and len(cand) > 3 and cand not in ids:
+            ids.append(cand)
+    return ids
 
 
 def decide(analysis: dict, tool_outputs: dict, ticket_text: str = "") -> TriageResult:
-    """Apply the locked OR escalation policy over analysis + tool evidence."""
+    """Trust the LLM analysis; apply only confidence floors, no regex policy."""
+    _ = ticket_text  # kept for caller compat; ignored — LLM decides.
     if analysis.get("fallback"):
+        # No evidence suffix: fallback collects the customer profile only,
+        # and decide_node quotes it into reasoning directly.
         return TriageResult(
             urgency=analysis.get("urgency", "high"),
             product=analysis.get("product", "unknown"),
@@ -157,53 +160,58 @@ def decide(analysis: dict, tool_outputs: dict, ticket_text: str = "") -> TriageR
             sentiment=analysis.get("sentiment", "unknown"),
             kb_refs=tool_outputs.get("kb_ids", []),
             next_action="escalate to human",
-            reasoning=analysis.get("reasoning", "") + f" | evidence: {tool_outputs.get('billing', '')} {tool_outputs.get('status', '')}".strip(),
+            reasoning=analysis.get("reasoning", ""),
             confidence=0.5,
         )
 
-    status_text = tool_outputs.get("status", "").lower()
-    billing_text = tool_outputs.get("billing", "").lower()
-    ticket_lower = ticket_text.lower()
-    reasoning_lower = analysis.get("reasoning", "").lower()
+    # LLM decides: next_action alone determines escalation.
+    # urgency="critical" no longer forces escalate; the model expresses
+    # escalation via next_action="escalate to human".
+    llm_escalate = analysis.get("next_action") == "escalate to human"
 
-    outage_escalation = "degraded" in status_text and ("500" in status_text or "500" in ticket_lower)
-
-    deadline_hints = ("presentation", "deadline", "end of day", "2 hours", "2h", "บ่ายนี้")
-    has_billing_pending = "pending" in billing_text or "unrefunded" in billing_text
-    billing_deadline = has_billing_pending and any(
-        kw in ticket_lower or kw in reasoning_lower for kw in deadline_hints
-    )
-
-    is_negated_dispute = any(
-        neg in reasoning_lower
-        for neg in ("no dispute", "no urgent issues or disputes", "without dispute", "not disput")
-    )
-    dispute_threat = "disput" in ticket_lower or ("disput" in reasoning_lower and not is_negated_dispute)
-
-    llm_escalate = (
-        analysis.get("next_action") == "escalate to human"
-        or analysis.get("urgency") == "critical"
-    )
-
-    escalate = outage_escalation or billing_deadline or dispute_threat or llm_escalate
-
-    if escalate:
-        action, confidence = "escalate to human", 0.95
+    base_urgency = analysis.get("urgency", "medium")
+    # Preserve LLM calibration: policy sets a floor, never downgrades a higher
+    # LLM confidence. E.g. LLM 0.99 route-to-specialist stays 0.99, not 0.8.
+    try:
+        llm_conf = float(analysis.get("confidence", 0.0))
+    except (TypeError, ValueError):
+        llm_conf = 0.0
+    if llm_escalate:
+        # LLM chose escalate: keep its urgency as-is, floor confidence.
+        action, confidence = "escalate to human", max(0.95, min(1.0, llm_conf) if llm_conf else 0.95)
+        urgency = base_urgency
     elif analysis.get("next_action") == "route to specialist" or any("bug" in str(t).lower() for t in analysis.get("issue_types", [])):
-        action, confidence = "route to specialist", 0.8
+        action, confidence = "route to specialist", max(0.8, min(1.0, llm_conf) if llm_conf else 0.8)
+        urgency = base_urgency
     elif analysis.get("urgency") == "low" or analysis.get("next_action") == "auto-respond":
-        action, confidence = "auto-respond", 0.9
+        action, confidence = "auto-respond", max(0.9, min(1.0, llm_conf) if llm_conf else 0.9)
+        urgency = base_urgency
     else:
-        action, confidence = "route to specialist", 0.7
+        action, confidence = "route to specialist", max(0.7, min(1.0, llm_conf) if llm_conf else 0.7)
+        urgency = base_urgency
+
+    evidence_bits = []
+    for label, text in (("billing", tool_outputs.get("billing", "")), ("status", tool_outputs.get("status", ""))):
+        t = str(text).strip()
+        if not t:
+            continue
+        low = t.lower()
+        if low.startswith("skipped"):
+            continue
+        # Bound reasoning size / PII surface: evidence is a short excerpt, not a dump.
+        if len(t) > 300:
+            t = t[:300] + "…"
+        evidence_bits.append(f"{label}: {t}")
+    evidence_suffix = f" | evidence: {' ; '.join(evidence_bits)}" if evidence_bits else ""
 
     return TriageResult(
-        urgency=analysis.get("urgency", "medium"),
+        urgency=urgency,
         product=analysis.get("product", "general"),
         issue_types=analysis.get("issue_types", []),
         sentiment=analysis.get("sentiment", "neutral"),
         kb_refs=tool_outputs.get("kb_ids", []),
         next_action=action,
-        reasoning=analysis.get("reasoning", "") + f" | evidence: {tool_outputs.get('billing', '')} {tool_outputs.get('status', '')}".strip(),
+        reasoning=analysis.get("reasoning", "") + evidence_suffix,
         confidence=confidence,
     )
 
@@ -216,7 +224,7 @@ def ingest_node(state: TicketState) -> dict:
     ticket = state["ticket"]
     ticket_text = ingest(ticket)
     cust_id = ticket.get("customer_id", "unknown")
-    user_prompt = f"Customer ID: {cust_id}\n\nTicket Messages:\n{ticket_text}"
+    user_prompt = f"Customer ID: {cust_id}\n\nTicket Messages:\n<ticket>\n{ticket_text}\n</ticket>"
     return {
         "ticket_text": ticket_text,
         "messages": [
@@ -269,13 +277,15 @@ def decide_node(state: TicketState) -> dict:
     kb_msgs = [m.content for m in tool_msgs if m.name == "search_knowledge_base"]
     kb_ids: list[str] = []
     for k in kb_msgs:
-        for match in re.findall(r"kb-[\w-]+", k):
+        for match in _extract_kb_ids(k):
             if match not in kb_ids:
                 kb_ids.append(match)
 
     if not kb_ids and ticket_text:
-        direct_kb = tools.search_knowledge_base.invoke({"query": ticket_text})
-        kb_ids = re.findall(r"kb-[\w-]+", direct_kb)[:2]
+        # Cap the fallback query: full threads can be 200k chars and only
+        # dilute keyword scoring. First 2000 chars carry the signal.
+        direct_kb = tools.search_knowledge_base.invoke({"query": ticket_text[:2000]})
+        kb_ids = _extract_kb_ids(direct_kb)[:2]
 
     tool_outputs = {
         "billing": billing_out,
@@ -284,10 +294,23 @@ def decide_node(state: TicketState) -> dict:
     }
 
     if state.get("fallback") or not msgs:
-        cust_id = state.get("ticket", {}).get("customer_id", "")
-        fallback_tools = retrieve(ticket_text, cust_id) if cust_id else tool_outputs
+        # No-LLM path: fetch the customer profile only — the outcome is
+        # always `escalate to human`, so billing/status/KB lookups add no
+        # decision value. The profile is quoted into reasoning for handoff.
+        cust_id = state.get("ticket", {}).get("customer_id", "").strip()
+        profile_ev = (
+            tools.get_customer_profile.invoke({"customer_id": cust_id})
+            if cust_id
+            else "unknown customer."
+        )
+        fallback_tools = {
+            "billing": "skipped (fallback collects customer profile only).",
+            "status": "skipped (fallback collects customer profile only).",
+            "kb_ids": [],
+        }
         analysis = _degraded_analyze()
         res = decide(analysis, fallback_tools, ticket_text)
+        res.reasoning = f"{res.reasoning} | profile: {profile_ev}"
         return {"result": res, "tool_outputs": fallback_tools, "analysis": analysis}
 
     llm = get_llm()
@@ -305,10 +328,4 @@ def decide_node(state: TicketState) -> dict:
     return {"result": res, "tool_outputs": tool_outputs, "analysis": analysis}
 
 
-# Backward-compatible exports
-def analyze_node(state: TicketState) -> dict:
-    return {"analysis": analyze(state["ticket_text"])}
 
-
-def retrieve_node(state: TicketState) -> dict:
-    return {"tool_outputs": retrieve(state["ticket_text"], state["ticket"]["customer_id"])}
