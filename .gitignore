@@ -1,0 +1,32 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Env / OS
+.env
+.DS_Store
+
+# Local agent skills / scratch (per AGENTS.md)
+.agents/
+.scratch/
+
+# Local docs (assignment / working notes)
+docs/
+
+# Local agent config
+AGENTS.md
+skills-lock.json
+
+# IDE / coverage / logs (future-proof)
+.vscode/
+.idea/
+.coverage
+htmlcov/
+*.log
