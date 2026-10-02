@@ -15,13 +15,16 @@ Supports **OpenAI (default)** and **Gemini** via `LLM_PROVIDER`. No API key is b
 
 An AI agent that processes multi-message ticket threads (including Thai input), gathers facts with tools, and returns a structured `TriageResult` with reasoning and confidence.
 
-Sample tickets and expected LLM-path results:
+Sample tickets and typical LLM-path results (the LLM decides the action — no regex guard forces escalation, so exact outputs can vary with model/version):
 
 | Ticket | Thread | Expected |
 |---|---|---|
 | `ticket-1-billing` (Free, 3x $29.99 pending, dispute threat, presentation in 2h) | billing + access | `critical` / `escalate to human` |
 | `ticket-2-outage` (Enterprise 45 seats, Thai, error 500, Asia region) | outage + status-check | `critical` / `escalate to human` |
 | `ticket-3-darkmode` (Pro, friendly, macOS display bug + feature request) | bug + feature-request | `medium` / `route to specialist` |
+
+> [!NOTE]
+> Without an LLM key (or on LLM/schema error) every ticket instead fail-closes to `high` / `escalate to human` at confidence 0.5 with `unknown` fields — see Features above.
 
 See `docs/writeup.md` for architecture decisions, failure modes, and production eval; `docs/assignment-summary.md` for the assignment source summary.
 
@@ -30,9 +33,9 @@ See `docs/writeup.md` for architecture decisions, failure modes, and production 
 - **Urgency classification** — `critical` / `high` / `medium` / `low`, weighing business impact and deadline over plan tier.
 - **Multi-intent extraction** — product, `issue_types[]`, sentiment across the full thread (English and Thai input, English-only output).
 - **Knowledge-base grounding** — keyword search over 6 FAQ entries, cited as `kb_refs[]` (capped at top-2).
-- **Deterministic safety policy** — OR escalation (dispute threat, unrefunded money + deadline, org/region outage) applied over LLM analysis + tool evidence.
+- **LLM-decided actions + confidence floors** — `decide` trusts the LLM's `next_action`/`urgency`; it only applies confidence floors (`escalate` ≥0.95, `route to specialist` ≥0.8, `auto-respond` ≥0.9, fallback branch ≥0.7) and appends a ≤300-char billing/status evidence excerpt to `reasoning`. No regex escalation guard — outage/billing/dispute wording alone never forces escalation (see `tests/test_nodes.py`).
 - **4 mock tools** — `get_customer_profile`, `search_knowledge_base`, `check_system_status`, `check_billing` (no network, no key needed).
-- **Fail-closed fallback** — no key or LLM error → every ticket `escalate to human` at confidence 0.5 (customer profile quoted in reasoning, no billing/status/KB lookups), never auto-responds.
+- **Fail-closed fallback** — no key or LLM error → every ticket `escalate to human` at confidence 0.5 with `urgency: high`, `product` / `issue_types` / `sentiment` as `unknown` (customer profile quoted in reasoning, no billing/status/KB lookups), never auto-responds.
 - **FastAPI service** — `POST /triage` (single) + `POST /triage/batch` (many), `GET /tickets/samples`, `GET /health`, and direct `GET /tools/*` mock-tool checks; interactive docs at `/docs`, Postman collection included.
 
 ## How it works
@@ -52,7 +55,7 @@ flowchart TD
 
 - `ingest` joins the full thread (timestamps preserved) into initial agent messages.
 - `agent` binds the 4 mock tools to `ChatOpenAI` / `ChatGoogleGenerativeAI` and loops through `ToolNode` until no more `tool_calls`.
-- `decide` synthesizes the full message history via `finalize_prompt` with structured output (`TriageResult`), enforces the escalation guard, and caps `kb_refs` at top-2.
+- `decide` synthesizes the full message history via `finalize_prompt` with structured output (`TriageResult`), trusts the LLM's `next_action`/`urgency` (confidence floors only, see above), and caps `kb_refs` at top-2 (deduped, order-preserved; `TriageResult` validators also normalize `product`/`issue_types`/`sentiment` and clamp `confidence`).
 
 The FastAPI layer (`triage_agent/api.py`) is a thin stateless wrapper: it validates the HTTP payload (Pydantic), converts it to the internal ticket dict, and calls the same `run_ticket()` the console runner uses (via `asyncio.to_thread` so the event loop never blocks on the sync LangGraph run).
 
@@ -275,7 +278,7 @@ Example output (truncated):
 .venv/bin/python -m pytest -q
 ```
 
-Covers graph compilation, fail-closed fallback (all tickets escalate at 0.5 with no key), ReAct routing (`tools` vs `decide`), all 4 mock tools, CLI output for the 3 sample tickets, and the FastAPI layer (`/health`, `/tickets/samples`, `POST /triage` + `/triage/batch` incl. the `422` empty-payload cases and no-key `escalate to human` fallback, `GET /tools/*`). For manual exploration use `/docs` try-it-out or the Postman collection.
+Covers graph compilation, fail-closed fallback (all tickets `high` / escalate at 0.5 with no key), ReAct routing (`tools` vs `decide`), `decide` LLM-trust policy (outage/billing/dispute wording alone never forces escalation; bug → specialist; negated-dispute → no false escalation), all 4 mock tools (incl. Thai KB queries), the LLM path via a fake ChatModel (billing escalates, bug routes, schema violation fail-closes, Thai paraphrases trust the LLM), CLI output for the 3 sample tickets, and the FastAPI layer (`/health`, `/tickets/samples`, `POST /triage` + `/triage/batch` incl. `422` empty/blank/oversize cases, no-key `escalate to human` fallback, batch partial-failure isolation + order preservation, `X-Request-ID` header, rate-limit `429`, `GET /tools/*`). For manual exploration use `/docs` try-it-out or the Postman collection.
 
 ## Project structure
 
@@ -284,14 +287,14 @@ app.py                # root FastAPI entrypoint (`python app.py`, re-exports tri
 triage_agent/
   agent.py            # build_graph, compiled app, run_ticket
   api.py              # FastAPI service (POST /triage, /triage/batch, GET /health, /tickets/samples, /tools/*)
-  prompts.py          # REACT_AGENT_SYSTEM_PROMPT + finalize_prompt (English-only output, 3 few-shots)
+  prompts.py          # REACT_AGENT_SYSTEM_PROMPT + FINALIZE_SYSTEM_PROMPT/finalize_prompt (English-only output, prompt-injection guard, KB-ID grounding rule)
   sample_tickets.py   # 3 sample threads (timestamps kept, Thai kept for ticket 2)
   __main__.py         # console runner (prints TriageResult JSON per ticket)
   utils/
-    state.py          # TicketState (TypedDict) + TriageResult (Pydantic output schema)
-    nodes.py          # ingest / agent / decide nodes + degraded fallback + AFC workaround
+    state.py          # TicketState (TypedDict) + TriageResult (Pydantic output schema + normalizing validators)
+    nodes.py          # ingest / agent / decide nodes + degraded fallback + Gemini AFC workaround (fresh ChatModel per call, no key caching)
     tools.py          # 4 mock tools as @tool objects (never raise, return model-readable strings)
-    mock_data.py      # 3 customers, billing charges, region status, 6 KB entries
+    mock_data.py      # 3 customers, billing charges, region status, 6 KB entries (EN + Thai keywords)
 docs/
   writeup.md          # architecture, failure modes, production eval (+ §4 API exposure)
   assignment-summary.md # assignment source summary
@@ -299,7 +302,7 @@ postman_collection.json # Postman: meta → triage samples → custom/batch → 
 compose.yaml          # triage-agent (console, no ports) + api (uvicorn :8000)
 Dockerfile            # pip install -r requirements.txt, EXPOSE 8000, default CMD console
 tests/
-  test_graph.py test_nodes.py test_tools.py
+  test_graph.py test_nodes.py test_tools.py test_api.py test_llm_path.py
 ```
 
 ## Troubleshooting
@@ -312,6 +315,5 @@ tests/
 | `POST /triage*` → `429 rate limit exceeded` | Too many triage calls from one IP. Wait a minute or raise `RATE_LIMIT_PER_MIN` (`0` disables). |
 | Port `8000` already in use / `docker compose up api` won't start | Another uvicorn running — stop it or remap (`.venv/bin/python app.py --port 8001`, update Postman `baseUrl`). |
 | `automatic function calling` warnings on stderr (Gemini) | Outdated workaround — `nodes.py:_with_structured_output_no_afc` should bind `AutomaticFunctionCallingConfig(disable=True)`. |
-| `Customer not found` / `Unknown region` / `No matching articles` in reasoning | Mock-data miss — tools return strings, never raise; `decide` fail-closes to `escalate to human`. Check `mock_data.py` ids/regions. |
+| `Customer not found` / `Unknown region` / `No matching articles` in reasoning | Mock-data miss — tools return strings, never raise; the LLM still decides the action (`decide` applies no regex guard). Check `mock_data.py` ids/regions. |
 | `ModuleNotFoundError: langchain_*` | Venv not installed — run `pip install -e .` inside `.venv`. The fallback path alone runs on stdlib, the LLM path needs deps. |
-```

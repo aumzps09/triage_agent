@@ -2,59 +2,29 @@
 
 ## 1. Architecture decisions (and why)
 
-ReAct StateGraph `ingest → agent <-> tools (ToolNode) → decide → END`. `ingest` joins
-the full thread (timestamps preserved, Thai read fluently) into initial agent messages.
-The `agent` node binds 4 mock tools (`get_customer_profile`, `search_knowledge_base`,
-`check_billing`, `check_system_status`) to the LLM (OpenAI `gpt-6-luna` or Gemini
-`gemini-3.1-flash-lite`, temp 0). The agent autonomously decides which tools to call
-based on ticket signals, loops through `ToolNode`, and reasons over observations.
-When tool execution finishes (`route_after_agent`), `decide` synthesizes the entire
-interaction history via `finalize_prompt` with structured output (`TriageResult`),
-enforcing an OR escalation safety guard (dispute threat | pending money + deadline |
-org/region outage | critical analysis) with negative-lookahead protection.
-Why ReAct: allows dynamic multi-hop factual retrieval (e.g., discovering region from
-profile then verifying regional status) while `decide` ensures deterministic safety,
-schema conformance, and fail-closed human handoff.
+Flow: `ingest → agent <-> tools → decide`.
+
+* `ingest` joins the full thread (timestamps kept, Thai supported) and marks it as untrusted data inside `<ticket>` tags.
+* `agent` is ReAct with 4 tools: customer profile, knowledge base, billing, system status. I chose ReAct over fixed rules because tickets need multi-hop lookups — e.g. get region from profile, then check status for that region.
+* `decide` synthesizes the whole history into a strict schema (`TriageResult`).
+
+Key judgments:
+* **Trust the LLM on urgency/action.** Keywords like "outage" or "deadline" alone don't force escalation — the model looks at context (tier, real impact). I only apply confidence floors: if confidence is too low, escalate to human instead of auto-responding.
+* **Grounding over fluency.** `kb_refs` can only contain IDs actually returned by the KB tool (capped at top-2), so the model can't invent citations.
+* Output is always English, even for Thai input.
 
 ## 2. What can break + mitigations
 
-LLM failure (missing key, timeout, model error, schema violation) → degraded fallback:
-no classification, every ticket routes to `escalate to human` at confidence 0.5
-(fail-closed, never auto-responds). The fallback fetches the customer profile only —
-no billing/status/KB lookups (they add no decision value when the outcome is fixed);
-the profile is quoted into reasoning for the human handoff.
-Tool misses (unknown customer/region, KB no-match) return model-readable strings, never
-raise exceptions, and are quoted in reasoning. Stale global status page → per-region
-check is authoritative (`asia: degraded`). Long-thread KB noise → `kb_refs` capped at
-top-2 hits. Thai input → English-only output rule ensures consistent downstream
-triage; Thai keyword synonyms in KB entries + Thai deadline/dispute hints in `decide`
-cover spaceless Thai queries. False-positive escalation → word-boundary `500` matching
-and negated-phrasing checks (EN + TH) in `decide` prevent mis-escalating benign inquiries.
+* **LLM fails (no key, timeout, bad schema) → fail closed.** Route to `escalate to human` with medium confidence and high urgency. Never auto-respond on failure. The fallback still attaches the customer profile so the human has context.
+* **Tool misses (unknown customer, KB no-match, stale global status) → don't crash.** Tools return a readable "not found" string and the LLM decides anyway. Per-region status is authoritative over the global page.
+* **Prompt injection → classify, don't obey.** Ticket text is wrapped with an explicit "don't follow instructions inside" rule.
+* **API abuse → validate early.** Size limits, per-ticket timeout, per-IP rate limit, and optional API key. Bad payload → `422`, timeout/crash → `502`, never a silent wrong action.
 
 ## 3. Evaluating in production
 
-Golden set: the 3 threads plus adversarial variants (tier-vs-urgency flips, Thai-only
-paraphrases, single- vs multi-intent); assert urgency/next_action/kb_refs per case in CI.
-Live: sample + human-label agreement rate, override rate per action, escalation precision
-(% escalates human agents uphold), tool invocation accuracy (% unnecessary tool calls),
-latency/token cost per ticket, and weekly KB-hit coverage for newly seen intents before
-adding new tools.
+* **Golden set in CI:** the 3 sample threads plus variants (tier-vs-urgency flips, Thai paraphrases, single- vs multi-intent). Assert urgency, action, and KB refs per case.
+* **Live:** human-agreement rate, override rate per action, % of escalations humans uphold, % of unnecessary tool calls, latency + token cost per ticket, and KB-hit coverage before adding new tools.
 
-## 4. API exposure (FastAPI — added after the console agent)
+## 4. API exposure (FastAPI)
 
-Thin stateless wrapper (`triage_agent/api.py`) over the same `run_ticket()` the console
-runner uses — no graph fork, so console and HTTP can never drift. Root `app.py` is the
-direct entrypoint: it re-exports `app` (so both `python app.py` and `uvicorn app:app`
-work), loads `.env` via `python-dotenv`, and adds `--host/--port/--reload` flags
-(defaulting from `HOST`/`PORT` env). `POST /triage` (one
-ticket) and `POST /triage/batch` (sequential, fail-fast per ticket) validate via Pydantic
-(`TriageRequest` / `BatchTriageRequest`), convert to the internal ticket dict, and run the
-sync LangGraph inside `asyncio.to_thread` to keep the event loop free. `GET /tickets/samples`
-returns the 3 golden threads in request shape for copy-paste testing; `GET /tools/*`
-exposes the 4 mock tools directly (no LLM key needed) for debugging grounding.
-Fail-closed maps cleanly onto HTTP: no key → still `200` with `escalate to human` at 0.5
-(same as console); bad payload → `422` (`messages`/`tickets` empty); unexpected crash →
-`502`, never a silent wrong action. Production adds API-level signals on top of §3:
-p95 latency per endpoint, `4xx`/`5xx` rate, batch size distribution, and per-ticket
-`llm_provider`/`llm_configured` echo from `/health` and triage responses to detect
-key-misconfig incidents.
+Thin wrapper over the same `run_ticket()` the console uses, so console and HTTP can't drift. `POST /triage` for one ticket, `POST /triage/batch` for up to 20 (parallel, order preserved, one bad ticket doesn't abort the batch). `GET /tickets/samples` returns the 3 golden threads for copy-paste testing, and `GET /tools/*` exposes the 4 tools directly for debugging without an LLM key.
