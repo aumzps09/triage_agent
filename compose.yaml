@@ -1,0 +1,9 @@
+services:
+  triage-agent:
+    build: .
+    image: triage-agent
+    env_file:
+      - path: .env
+        required: false
+    # No ports/DB — console app only. No key → degraded fallback (escalate all);
+    # set a provider key in .env (see .env.example) to enable the LLM path.

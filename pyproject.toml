@@ -1,0 +1,20 @@
+[project]
+name = "triage-agent"
+version = "0.1.0"
+description = "LangChain + LangGraph triage agent for customer-support tickets"
+requires-python = ">=3.12"
+dependencies = [
+    "langchain-core>=0.3",
+    "langgraph>=0.2",
+    "langchain-openai>=0.2",
+    "langchain-google-genai>=2",
+    "pydantic>=2",
+]
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["triage_agent*"]
