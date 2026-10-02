@@ -10,8 +10,17 @@ from __future__ import annotations
 
 import os
 import re
+from typing import Literal
 
-from ..prompts import triage_prompt
+from langchain_core.messages import (
+    AIMessage,
+    BaseMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+)
+
+from ..prompts import REACT_AGENT_SYSTEM_PROMPT, finalize_prompt, triage_prompt
 from . import tools
 from .mock_data import CUSTOMERS, SYSTEM_STATUS
 from .state import TicketState, TriageResult
@@ -30,13 +39,8 @@ def ingest(ticket: dict) -> str:
     return "\n".join(f"[{t}] {m}" for t, m in ticket["messages"])
 
 
-def _llm_analyze(ticket_text: str) -> TriageResult | None:
-    """Try the LangChain structured-output path; return None on any failure.
-
-    Provider selected via `LLM_PROVIDER` (`openai` default, or `gemini`).
-    OpenAI uses `OPENAI_API_KEY`/`OPENAI_MODEL` (default `gpt-6-luna`);
-    Gemini uses `GOOGLE_API_KEY`/`GEMINI_MODEL` (default `gemini-3.1-flash-lite`).
-    """
+def get_llm():  # type: ignore[no-untyped-def]
+    """Return the configured ChatModel instance, or None if keys are absent."""
     provider = os.getenv("LLM_PROVIDER", "openai").strip().lower()
     try:
         if provider == "gemini":
@@ -44,7 +48,7 @@ def _llm_analyze(ticket_text: str) -> TriageResult | None:
                 return None
             from langchain_google_genai import ChatGoogleGenerativeAI
 
-            llm = ChatGoogleGenerativeAI(
+            return ChatGoogleGenerativeAI(
                 model=os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite"), temperature=0
             )
         else:
@@ -52,7 +56,17 @@ def _llm_analyze(ticket_text: str) -> TriageResult | None:
                 return None
             from langchain_openai import ChatOpenAI
 
-            llm = ChatOpenAI(model=os.getenv("OPENAI_MODEL", "gpt-6-luna"))
+            return ChatOpenAI(model=os.getenv("OPENAI_MODEL", "gpt-6-luna"))
+    except Exception:
+        return None
+
+
+def _llm_analyze(ticket_text: str) -> TriageResult | None:
+    """Try the LangChain structured-output path; return None on any failure."""
+    llm = get_llm()
+    if llm is None:
+        return None
+    try:
         chain = triage_prompt | _with_structured_output_no_afc(llm)
         out = chain.invoke({"ticket_text": ticket_text})
         return out if isinstance(out, TriageResult) else TriageResult(**dict(out))
@@ -61,17 +75,8 @@ def _llm_analyze(ticket_text: str) -> TriageResult | None:
 
 
 def _with_structured_output_no_afc(llm):  # type: ignore[no-untyped-def]
-    """Structured output with SDK automatic function calling disabled.
-
-    Works around https://github.com/langchain-ai/langchain-google/pull/1980:
-    `ChatGoogleGenerativeAI` never sets `automatic_function_calling`, so the
-    underlying `google-genai` SDK takes its AFC path in
-    `Models.generate_content` and logs a "not recommended" warning on every
-    request — even with no tools bound. LangChain runs its own tool loop and
-    only sends tool declarations, so SDK-side AFC should stay off.
-    """
+    """Structured output with SDK automatic function calling disabled."""
     structured = llm.with_structured_output(TriageResult, method="json_schema")
-    # Only the Gemini chat model supports this kwarg; OpenAI takes another path.
     if llm.__class__.__name__ != "ChatGoogleGenerativeAI":
         return structured
     try:
@@ -87,17 +92,12 @@ def _with_structured_output_no_afc(llm):  # type: ignore[no-untyped-def]
 
 
 def _degraded_analyze() -> dict:
-    """Degraded fallback (LLM unavailable): no classification, escalate all.
-
-    Deliberately generic — `decide` sees `"fallback": True` and routes every
-    ticket to a human with low confidence.
-    """
+    """Degraded fallback (LLM unavailable): no classification, escalate all."""
     return {
         "urgency": "high",
         "product": "unknown",
         "issue_types": ["unknown"],
         "sentiment": "unknown",
-        "sentiment_trajectory": "unknown (LLM unavailable)",
         "reasoning": "LLM analysis unavailable; routing to human without classification.",
         "fallback": True,
     }
@@ -128,7 +128,7 @@ def _extract_region(ticket_text: str, customer_id: str) -> str:
 
 
 def retrieve(ticket_text: str, customer_id: str) -> dict:
-    """Call tools directly (no ToolNode loop): profile+KB always, others by keyword."""
+    """Call tools directly: profile+KB always, others by keyword."""
     low = ticket_text.lower()
     out = {
         "profile": tools.get_customer_profile.invoke({"customer_id": customer_id}),
@@ -143,46 +143,64 @@ def retrieve(ticket_text: str, customer_id: str) -> dict:
         out["status"] = tools.check_system_status.invoke({"region": _extract_region(ticket_text, customer_id)})
     else:
         out["status"] = "skipped (no outage signals)."
-    out["kb_ids"] = re.findall(r"kb-[\w-]+", out["kb"])[:2]  # top-2 expected refs per ticket
+    out["kb_ids"] = re.findall(r"kb-[\w-]+", out["kb"])[:2]
     return out
 
 
-def decide(analysis: dict, tool_outputs: dict) -> TriageResult:
-    """Apply the locked OR escalation policy over analysis + tool evidence.
-
-    Degraded fallback (`analysis["fallback"]`, LLM unavailable) escalates every
-    ticket to a human with low confidence — fail-closed, never auto-respond.
-    """
+def decide(analysis: dict, tool_outputs: dict, ticket_text: str = "") -> TriageResult:
+    """Apply the locked OR escalation policy over analysis + tool evidence."""
     if analysis.get("fallback"):
         return TriageResult(
             urgency=analysis.get("urgency", "high"),
             product=analysis.get("product", "unknown"),
             issue_types=analysis.get("issue_types", ["unknown"]),
             sentiment=analysis.get("sentiment", "unknown"),
-            sentiment_trajectory=analysis.get("sentiment_trajectory", ""),
             kb_refs=tool_outputs.get("kb_ids", []),
             next_action="escalate to human",
             reasoning=analysis.get("reasoning", "") + f" | evidence: {tool_outputs.get('billing', '')} {tool_outputs.get('status', '')}".strip(),
             confidence=0.5,
         )
-    text = " ".join([analysis.get("reasoning", ""), tool_outputs.get("billing", ""), tool_outputs.get("status", "")]).lower()
-    escalate = (
-        "disput" in text
-        or ("pending" in text and ("presentation" in text or "deadline" in text or "end of day" in text))
-        or ("degraded" in text and "500" in text)
+
+    status_text = tool_outputs.get("status", "").lower()
+    billing_text = tool_outputs.get("billing", "").lower()
+    ticket_lower = ticket_text.lower()
+    reasoning_lower = analysis.get("reasoning", "").lower()
+
+    outage_escalation = "degraded" in status_text and ("500" in status_text or "500" in ticket_lower)
+
+    deadline_hints = ("presentation", "deadline", "end of day", "2 hours", "2h", "บ่ายนี้")
+    has_billing_pending = "pending" in billing_text or "unrefunded" in billing_text
+    billing_deadline = has_billing_pending and any(
+        kw in ticket_lower or kw in reasoning_lower for kw in deadline_hints
     )
+
+    is_negated_dispute = any(
+        neg in reasoning_lower
+        for neg in ("no dispute", "no urgent issues or disputes", "without dispute", "not disput")
+    )
+    dispute_threat = "disput" in ticket_lower or ("disput" in reasoning_lower and not is_negated_dispute)
+
+    llm_escalate = (
+        analysis.get("next_action") == "escalate to human"
+        or analysis.get("urgency") == "critical"
+    )
+
+    escalate = outage_escalation or billing_deadline or dispute_threat or llm_escalate
+
     if escalate:
         action, confidence = "escalate to human", 0.95
-    elif analysis.get("urgency") == "low":
+    elif analysis.get("next_action") == "route to specialist" or any("bug" in str(t).lower() for t in analysis.get("issue_types", [])):
+        action, confidence = "route to specialist", 0.8
+    elif analysis.get("urgency") == "low" or analysis.get("next_action") == "auto-respond":
         action, confidence = "auto-respond", 0.9
     else:
         action, confidence = "route to specialist", 0.7
+
     return TriageResult(
         urgency=analysis.get("urgency", "medium"),
         product=analysis.get("product", "general"),
         issue_types=analysis.get("issue_types", []),
         sentiment=analysis.get("sentiment", "neutral"),
-        sentiment_trajectory=analysis.get("sentiment_trajectory", ""),
         kb_refs=tool_outputs.get("kb_ids", []),
         next_action=action,
         reasoning=analysis.get("reasoning", "") + f" | evidence: {tool_outputs.get('billing', '')} {tool_outputs.get('status', '')}".strip(),
@@ -190,20 +208,107 @@ def decide(analysis: dict, tool_outputs: dict) -> TriageResult:
     )
 
 
-# --- Graph nodes (one per topology step) ---
+# --- ReAct Graph Nodes ---
 
 
 def ingest_node(state: TicketState) -> dict:
-    return {"ticket_text": ingest(state["ticket"])}
+    """Format thread and initialize ReAct agent messages."""
+    ticket = state["ticket"]
+    ticket_text = ingest(ticket)
+    cust_id = ticket.get("customer_id", "unknown")
+    user_prompt = f"Customer ID: {cust_id}\n\nTicket Messages:\n{ticket_text}"
+    return {
+        "ticket_text": ticket_text,
+        "messages": [
+            SystemMessage(content=REACT_AGENT_SYSTEM_PROMPT),
+            HumanMessage(content=user_prompt),
+        ],
+    }
 
 
+def agent_node(state: TicketState) -> dict:
+    """Invoke LLM with bound tools in the ReAct loop."""
+    llm = get_llm()
+    if llm is None:
+        return {
+            "fallback": True,
+            "messages": [AIMessage(content="LLM unavailable; routing to human fallback.")],
+        }
+    try:
+        tools_list = tools.as_langchain_tools()
+        llm_with_tools = llm.bind_tools(tools_list)
+        response = llm_with_tools.invoke(state["messages"])
+        return {"messages": [response]}
+    except Exception as e:
+        return {
+            "fallback": True,
+            "messages": [AIMessage(content=f"LLM execution error: {e}")],
+        }
+
+
+def route_after_agent(state: TicketState) -> Literal["tools", "decide"]:
+    """Conditional edge: route to tools if tool_calls exist, else finalize via decide."""
+    if state.get("fallback"):
+        return "decide"
+    msgs = state.get("messages", [])
+    if msgs and getattr(msgs[-1], "tool_calls", None):
+        return "tools"
+    return "decide"
+
+
+def decide_node(state: TicketState) -> dict:
+    """Synthesize full ReAct message history into validated TriageResult."""
+    ticket_text = state.get("ticket_text", "")
+    msgs = state.get("messages", [])
+
+    # Extract all observations returned by ToolNode
+    tool_msgs = [m for m in msgs if isinstance(m, ToolMessage)]
+    billing_out = next((m.content for m in tool_msgs if m.name == "check_billing"), "skipped (no billing signals).")
+    status_out = next((m.content for m in tool_msgs if m.name == "check_system_status"), "skipped (no outage signals).")
+
+    kb_msgs = [m.content for m in tool_msgs if m.name == "search_knowledge_base"]
+    kb_ids: list[str] = []
+    for k in kb_msgs:
+        for match in re.findall(r"kb-[\w-]+", k):
+            if match not in kb_ids:
+                kb_ids.append(match)
+
+    if not kb_ids and ticket_text:
+        direct_kb = tools.search_knowledge_base.invoke({"query": ticket_text})
+        kb_ids = re.findall(r"kb-[\w-]+", direct_kb)[:2]
+
+    tool_outputs = {
+        "billing": billing_out,
+        "status": status_out,
+        "kb_ids": kb_ids[:2],
+    }
+
+    if state.get("fallback") or not msgs:
+        cust_id = state.get("ticket", {}).get("customer_id", "")
+        fallback_tools = retrieve(ticket_text, cust_id) if cust_id else tool_outputs
+        analysis = _degraded_analyze()
+        res = decide(analysis, fallback_tools, ticket_text)
+        return {"result": res, "tool_outputs": fallback_tools, "analysis": analysis}
+
+    llm = get_llm()
+    if llm is None:
+        analysis = _degraded_analyze()
+    else:
+        try:
+            chain = finalize_prompt | _with_structured_output_no_afc(llm)
+            structured = chain.invoke({"messages": msgs})
+            analysis = structured.to_dict() if isinstance(structured, TriageResult) else dict(structured)
+        except Exception:
+            analysis = _degraded_analyze()
+
+    res = decide(analysis, tool_outputs, ticket_text)
+    return {"result": res, "tool_outputs": tool_outputs, "analysis": analysis}
+
+
+# Backward-compatible exports
 def analyze_node(state: TicketState) -> dict:
     return {"analysis": analyze(state["ticket_text"])}
 
 
 def retrieve_node(state: TicketState) -> dict:
     return {"tool_outputs": retrieve(state["ticket_text"], state["ticket"]["customer_id"])}
-
-
-def decide_node(state: TicketState) -> dict:
-    return {"result": decide(state["analysis"], state["tool_outputs"])}

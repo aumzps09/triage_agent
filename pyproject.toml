@@ -9,6 +9,13 @@ dependencies = [
     "langchain-openai>=0.2",
     "langchain-google-genai>=2",
     "pydantic>=2",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
 ]
 
 [build-system]

@@ -18,7 +18,8 @@ build/
 .scratch/
 
 # Local docs (assignment / working notes)
-docs/
+docs/*
+!docs/writeup.md
 
 # Local agent config
 AGENTS.md

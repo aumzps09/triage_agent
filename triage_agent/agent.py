@@ -1,24 +1,34 @@
-"""Code for constructing the triage graph: ingest -> analyze -> retrieve -> decide."""
+"""Code for constructing the triage ReAct graph: ingest -> agent <-> tools -> decide -> END."""
 
 from __future__ import annotations
 
 from langgraph.graph import END, START, StateGraph
+from langgraph.prebuilt import ToolNode
 
-from .utils.nodes import analyze_node, decide_node, ingest_node, retrieve_node
+from .utils.nodes import agent_node, decide_node, ingest_node, route_after_agent
 from .utils.state import TicketState, TriageResult
+from .utils.tools import as_langchain_tools
 
 
 def build_graph():  # type: ignore[no-untyped-def]
-    """Linear START -> ingest -> analyze -> retrieve -> decide -> END."""
+    """ReAct StateGraph: ingest -> agent <-> tools -> decide -> END."""
     graph = StateGraph(TicketState)
     graph.add_node("ingest", ingest_node)
-    graph.add_node("analyze", analyze_node)
-    graph.add_node("retrieve", retrieve_node)
+    graph.add_node("agent", agent_node)
+    graph.add_node("tools", ToolNode(as_langchain_tools()))
     graph.add_node("decide", decide_node)
+
     graph.add_edge(START, "ingest")
-    graph.add_edge("ingest", "analyze")
-    graph.add_edge("analyze", "retrieve")
-    graph.add_edge("retrieve", "decide")
+    graph.add_edge("ingest", "agent")
+    graph.add_conditional_edges(
+        "agent",
+        route_after_agent,
+        {
+            "tools": "tools",
+            "decide": "decide",
+        },
+    )
+    graph.add_edge("tools", "agent")
     graph.add_edge("decide", END)
     return graph.compile()
 
